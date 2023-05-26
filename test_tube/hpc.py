@@ -35,12 +35,12 @@ class AbstractCluster(object):
         self.out_log_path = None
         self.modules = []
         self.script_name = os.path.realpath(sys.argv[0])
-        self.job_time = '15:00'
-        self.minutes_to_checkpoint_before_walltime = 5
+        self.job_time = '04:00:00'
         self.per_experiment_nb_gpus = 1
         self.per_experiment_nb_cpus = 1
         self.per_experiment_nb_nodes = 1
         self.memory_mb_per_node = 2000
+        self.memory_mb_per_cpu = 1024
         self.email = None
         self.notify_on_end = False
         self.notify_on_fail = False
@@ -52,40 +52,6 @@ class AbstractCluster(object):
         self.commands = []
         self.slurm_commands = []
         self.hpc_exp_number = 0
-
-        # these are set via getters and setters so we can use a BaseManager which can be shared across processes
-        self.checkpoint_save_function = None
-        self.checkpoint_load_function = None
-
-        # detect when this was called because a slurm object started a hopt.
-        # if true, remove the flag so tt logs don't show it
-        if hyperparam_optimizer is not None:
-
-            self.is_from_slurm_object = HyperOptArgumentParser.TRIGGER_CMD in vars(self.hyperparam_optimizer) and vars(self.hyperparam_optimizer)[HyperOptArgumentParser.TRIGGER_CMD] == True
-            if self.is_from_slurm_object:
-                self.hyperparam_optimizer.__delattr__(HyperOptArgumentParser.TRIGGER_CMD)
-
-            self.call_load_checkpoint = HyperOptArgumentParser.SLURM_LOAD_CMD in vars(self.hyperparam_optimizer)
-            if self.call_load_checkpoint:
-                self.hyperparam_optimizer.__delattr__(HyperOptArgumentParser.SLURM_LOAD_CMD)
-
-            self.hpc_exp_number = self.hyperparam_optimizer.hpc_exp_number
-
-    def set_checkpoint_save_function(self, fx, kwargs):
-        self.checkpoint_save_function = [fx, kwargs]
-
-    def get_checkpoint_save_function(self):
-        return self.checkpoint_save_function
-
-    def set_checkpoint_load_function(self, fx, kwargs):
-        # if we were passed in the load flag, then we call the load function as soon as it's added
-        if self.call_load_checkpoint:
-            fx(**kwargs)
-
-        self.checkpoint_load_function = [fx, kwargs]
-
-    def get_checkpoint_load_function(self):
-        return self.checkpoint_load_function
 
     def add_slurm_cmd(self, cmd, value, comment):
         self.slurm_commands.append((cmd, value, comment))
@@ -114,21 +80,23 @@ class SlurmCluster(AbstractCluster):
 
     def optimize_parallel_cluster_gpu(
             self,
-            train_function,
-            nb_trials,
+            pytorch_cli_path,
+            base_config_path,
             job_name,
+            nb_trials=None,
             enable_auto_resubmit=False,
             job_display_name=None
     ):
         if job_display_name is None:
             job_display_name = job_name
 
-        self.__optimize_parallel_cluster_internal(train_function, nb_trials, job_name, job_display_name,
+        self.__optimize_parallel_cluster_internal(pytorch_cli_path, base_config_path, nb_trials, job_name, job_display_name,
                                                   enable_auto_resubmit, on_gpu=True)
 
     def optimize_parallel_cluster_cpu(
             self,
-            train_function,
+            pytorch_cli_path,
+            base_config_path,
             nb_trials,
             job_name,
             enable_auto_resubmit=False,
@@ -137,12 +105,13 @@ class SlurmCluster(AbstractCluster):
         if job_display_name is None:
             job_display_name = job_name
 
-        self.__optimize_parallel_cluster_internal(train_function, nb_trials, job_name, job_display_name,
+        self.__optimize_parallel_cluster_internal(pytorch_cli_path, base_config_path, nb_trials, job_name, job_display_name,
                                                   enable_auto_resubmit, on_gpu=False)
 
     def __optimize_parallel_cluster_internal(
             self,
-            train_function,
+            pytorch_cli_path,
+            base_config_path,
             nb_trials,
             job_name,
             job_display_name,
@@ -151,7 +120,7 @@ class SlurmCluster(AbstractCluster):
     ):
         """
         Runs optimization on the attached cluster
-        :param train_function:
+        :param pytorch_cli_path:
         :param nb_trials:
         :param job_name:
         :return:
@@ -159,124 +128,43 @@ class SlurmCluster(AbstractCluster):
         self.job_name = job_name
         self.job_display_name = job_display_name
         self.on_gpu = on_gpu
-        self.enable_auto_resubmit = enable_auto_resubmit
 
         # layout logging structure
         self.__layout_logging_dir()
 
-        if self.is_from_slurm_object:
-            # Script is called by slurm: it's an actual experiment.
-            self.__run_experiment(train_function)
-        else:
-            # Launcher script. Generate trials and launch jobs.
+        # Launcher script. Generate trials and launch jobs.
 
-            # generate hopt trials
-            trials = self.hyperparam_optimizer.generate_trials(nb_trials)
+        # generate hopt trials
+        trials = self.hyperparam_optimizer.generate_trials(nb_trials)
 
-            # get the max test tube exp version so far if it's there
-            scripts_path = os.path.join(self.log_path, 'slurm_out_logs')
-            next_trial_version = self.__get_max_trial_version(scripts_path)
+        # get the max test tube exp version so far if it's there
+        scripts_path = os.path.join(self.log_path, 'slurm_out_logs')
+        next_trial_version = self.__get_max_trial_version(scripts_path)
 
-            # for each trial, generate a slurm command
-            for i, trial_params in enumerate(trials):
-                exp_i = i + next_trial_version
-                self.schedule_experiment(trial_params, exp_i)
+        # for each trial, generate a slurm command
+        for i, trial_params in enumerate(trials):
+            exp_i = i + next_trial_version
+            self.schedule_experiment(pytorch_cli_path, base_config_path, trial_params, exp_i, enable_auto_resubmit)
 
-    def schedule_experiment(self, trial_params, exp_i):
+    def schedule_experiment(self, pytorch_cli_path, base_config_path, trial_params, exp_i, enable_auto_resubmit):
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
         timestamp = 'trial_{}_{}'.format(exp_i, timestamp)
 
         # generate command
         slurm_cmd_script_path = os.path.join(self.slurm_files_log_path, '{}_slurm_cmd.sh'.format(timestamp))
-        slurm_cmd = self.__build_slurm_command(trial_params, slurm_cmd_script_path, timestamp, exp_i, self.on_gpu)
+        slurm_cmd = self.__build_slurm_command(pytorch_cli_path, base_config_path, trial_params, slurm_cmd_script_path, timestamp, exp_i, self.on_gpu, enable_auto_resubmit)
         self.__save_slurm_cmd(slurm_cmd, slurm_cmd_script_path)
 
         # run script to launch job
         print('\nlaunching exp...')
-        result = call('{} {}'.format(AbstractCluster.RUN_CMD, slurm_cmd_script_path), shell=True)
+        result = call(f'{AbstractCluster.RUN_CMD} {slurm_cmd_script_path}', shell=True)
         if result == 0:
             print('launched exp ', slurm_cmd_script_path)
         else:
             print('launch failed...')
 
-    def slurm_time_to_seconds(self, job_time):
-        seconds = 0
-        time_component = job_time
-        if '-' in job_time:
-            days, time_component = job_time.split('-')
-            seconds += int(days) * 24 * 60 * 60
-
-        time_components = time_component.split(':')
-        if len(time_components) == 3:
-            hours, minutes, secs = time_components
-            time_seconds = int(secs) + (int(minutes) * 60) + (int(hours) * 60 * 60)
-            seconds += time_seconds
-
-        elif len(time_components) == 2:
-            minutes, secs = time_components
-            time_seconds = int(secs) + (int(minutes) * 60)
-            seconds += time_seconds
-
-        elif len(time_components) == 1:
-            secs = time_components[0]
-            seconds += int(secs)
-
-        return seconds
-
-    def call_save(self):
-        print('calling save')
-
-        # if save function was passed, call it
-        if self.get_checkpoint_save_function() is not None:
-            save_fx, kwargs = self.get_checkpoint_save_function()
-            save_fx(**kwargs)
-
-            # if we're here, the job didn't finish and we were given a save function
-            # if we were given a load function, then schedule the program again and pass in the load function
-            if self.get_checkpoint_load_function() is not None:
-                job_id = os.environ['SLURM_JOB_ID']
-                cmd = 'scontrol requeue {}'.format(job_id)
-
-                print('\nrequeing job {}...'.format(job_id))
-                result = call(cmd, shell=True)
-                if result == 0:
-                    print('requeued exp ', job_id)
-                else:
-                    print('requeue failed...')
-
-        # stop program
-        os._exit(0)
-
-    def sig_handler(self, signum, frame):
-        print("caught signal", signum)
-        self.call_save()
-        # sys.exit(-1)
-
-    # ------------------------
-    # HANDLE SLURM SIGNALS
-    # ------------------------
-    def term_handler(self, signum, frame):
-        print("bypassing sigterm")
-
-    def __run_experiment(self, train_function):
-        if self.enable_auto_resubmit:
-            print('setting signal')
-            signal.signal(signal.SIGUSR1, self.sig_handler)
-            signal.signal(signal.SIGTERM, self.term_handler)
-
-        try:
-            # run training
-            train_function(self.hyperparam_optimizer, self)
-
-        except Exception as e:
-            print('Caught exception in worker thread', e)
-
-            # This prints the type, value, and stack trace of the
-            # current exception being handled.
-            traceback.print_exc()
-            raise SystemExit
-
     def __save_slurm_cmd(self, slurm_cmd, slurm_cmd_script_path):
+        print('saving slurm cmd to ', slurm_cmd_script_path)
         with open(slurm_cmd_script_path, mode='w') as file:
             file.write(slurm_cmd)
 
@@ -347,9 +235,6 @@ class SlurmCluster(AbstractCluster):
                 cmd = '--{} {}'.format(k, v)
             params.append(cmd)
 
-        # this arg lets the hyperparameter optimizer do its thing
-        params.append('--{}'.format(HyperOptArgumentParser.TRIGGER_CMD))
-
         full_cmd = ' '.join(params)
         return full_cmd
 
@@ -357,11 +242,11 @@ class SlurmCluster(AbstractCluster):
         v = str(v)
         return '[' in v or ';' in v or ' ' in v
 
-    def __build_slurm_command(self, trial, slurm_cmd_script_path, timestamp, exp_i, on_gpu):
+    def __build_slurm_command(self, pytorch_cli_path, base_config_path, trial, slurm_cmd_script_path, timestamp, exp_i, on_gpu, enable_auto_resubmit):
         sub_commands = []
 
         command =[
-            '#!/bin/bash',
+            '#!/bin/bash -l',
             '#',
             '# Auto-generated by test-tube (https://github.com/williamFalcon/test-tube)',
             '#################\n'
@@ -409,13 +294,13 @@ class SlurmCluster(AbstractCluster):
         if self.per_experiment_nb_gpus > 0 and on_gpu:
             command = [
                 '# gpus per node',
-                '#SBATCH --gres=gpu:{}'.format(self.per_experiment_nb_gpus),
+                '#SBATCH --gpus={}'.format(self.per_experiment_nb_gpus),
                 '#################\n'
             ]
             if self.gpu_type is not None:
                 command = [
                     '# gpus per node',
-                    '#SBATCH --gres=gpu:{}:{}'.format(self.gpu_type, self.per_experiment_nb_gpus),
+                    '#SBATCH --gpus={}:{}'.format(self.gpu_type, self.per_experiment_nb_gpus),
                     '#################\n'
                 ]
             sub_commands.extend(command)
@@ -438,21 +323,30 @@ class SlurmCluster(AbstractCluster):
         sub_commands.extend(command)
 
         # pick memory per node
+        # command = [
+        #     '# memory per node',
+        #     '#SBATCH --mem={}'.format(self.memory_mb_per_node),
+        #     '#################\n'
+        # ]
+        # sub_commands.extend(command)
+
+        # pick memory per task
         command = [
-            '# memory per node',
-            '#SBATCH --mem={}'.format(self.memory_mb_per_node),
+            '# memory per task',
+            '#SBATCH --mem-per-cpu={}'.format(self.memory_mb_per_cpu),
             '#################\n'
         ]
         sub_commands.extend(command)
 
         # add signal command to catch job termination
-        command = [
-            '# slurm will send a signal this far out before it kills the job',
-            f'#SBATCH --signal=USR1@{self.minutes_to_checkpoint_before_walltime * 60}',
+        if enable_auto_resubmit:
+            command = [
+                '# slurm will send a signal this far out before it kills the job',
+            f'#SBATCH --signal=USR1@90',
             '#################\n'
         ]
 
-        sub_commands.extend(command)
+            sub_commands.extend(command)
 
         # Subscribe to email if requested
         mail_type = []
@@ -496,13 +390,8 @@ class SlurmCluster(AbstractCluster):
 
         # add run command
         trial_args = self.__get_hopt_params(trial)
-        trial_args = '{} --{} {} --{} {}'.format(trial_args,
-                                                 HyperOptArgumentParser.SLURM_CMD_PATH,
-                                                 slurm_cmd_script_path,
-                                                 HyperOptArgumentParser.SLURM_EXP_CMD,
-                                                 exp_i)
 
-        cmd = 'srun {} {} {}'.format(self.python_cmd, self.script_name, trial_args)
+        cmd = f'srun {self.python_cmd} {pytorch_cli_path} fit --config={base_config_path} {trial_args}'
         sub_commands.append(cmd)
 
         # build full command with empty lines in between
