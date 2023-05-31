@@ -138,8 +138,11 @@ class SlurmCluster(AbstractCluster):
         trials = self.hyperparam_optimizer.generate_trials(nb_trials)
 
         # get the max test tube exp version so far if it's there
-        scripts_path = os.path.join(self.log_path, 'slurm_out_logs')
-        next_trial_version = self.__get_max_trial_version(scripts_path)
+        if self.enable_log_out:
+            scripts_path = os.path.join(self.log_path, 'slurm_out_logs')
+            next_trial_version = self.__get_max_trial_version(scripts_path)
+        else:
+            next_trial_version = 0
 
         # for each trial, generate a slurm command
         for i, trial_params in enumerate(trials):
@@ -184,7 +187,7 @@ class SlurmCluster(AbstractCluster):
         Generates dir structure for logging errors and outputs
         :return:
         """
-
+        print("Setting up slurm loggers to {}".format(self.log_path))
         # format the logging folder path
         slurm_out_path = os.path.join(self.log_path, self.job_name)
 
@@ -342,7 +345,7 @@ class SlurmCluster(AbstractCluster):
         if enable_auto_resubmit:
             command = [
                 '# slurm will send a signal this far out before it kills the job',
-            f'#SBATCH --signal=USR1@90',
+            f'#SBATCH --signal=SIGHUP@90',
             '#################\n'
         ]
 
