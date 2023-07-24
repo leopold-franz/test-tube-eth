@@ -41,7 +41,7 @@ class AbstractCluster(object):
         self.per_experiment_nb_cpus = 1
         self.per_experiment_nb_nodes = 1
         self.memory_mb_per_node = 2000
-        self.memory_mb_per_cpu = 1024
+        self.memory_mb_per_cpu = 1024  # Can also be "10G" corresponding to 10GB
         self.email = None
         self.notify_on_end = False
         self.notify_on_fail = False
