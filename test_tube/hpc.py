@@ -24,6 +24,7 @@ class AbstractCluster(object):
             python_cmd='python3',
             enable_log_err=True,
             enable_log_out=True,
+            stage='train'
     ):
         self.hyperparam_optimizer = hyperparam_optimizer
         self.log_path = log_path
@@ -52,6 +53,7 @@ class AbstractCluster(object):
         self.commands = []
         self.slurm_commands = []
         self.hpc_exp_number = 0
+        self.stage = stage
 
     def add_slurm_cmd(self, cmd, value, comment):
         self.slurm_commands.append((cmd, value, comment))
@@ -394,7 +396,7 @@ class SlurmCluster(AbstractCluster):
         # add run command
         trial_args = self.__get_hopt_params(trial)
 
-        cmd = f'srun {self.python_cmd} {pytorch_cli_path} fit --config={base_config_path} {trial_args}'
+        cmd = f'srun {self.python_cmd} {pytorch_cli_path} {self.stage} --config={base_config_path} {trial_args}'
         sub_commands.append(cmd)
 
         # build full command with empty lines in between
